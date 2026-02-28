@@ -153,7 +153,7 @@ def price_stats(prices):
 
 # StubHub event page URL pattern: stubhub.com/event/{ID}
 # Find it: go to stubhub.com, search "Springsteen MSG May 11", open event, copy ID from URL
-STUBHUB_EVENT_ID = '160512944'
+STUBHUB_EVENT_ID = '160512935'
 
 # SeatGeek event ID: confirmed from search results
 SEATGEEK_EVENT_ID = '18076751'
@@ -175,7 +175,7 @@ def scrape_stubhub():
         f'+AND+section_name:224&rows=100&start=0&wt=json'
     )
     data = fetch_json(api, extra_headers={
-        'Referer': f'https://www.stubhub.com/event/{STUBHUB_EVENT_ID}',
+        'Referer': f'https://www.stubhub.com/bruce-springsteen-new-york-tickets-5-11-2026/event/{STUBHUB_EVENT_ID}/',
     })
     if data:
         prices = pluck_prices(data)
@@ -187,7 +187,7 @@ def scrape_stubhub():
 
     # Strategy 2: Event page with embedded JSON
     page = fetch(
-        f'https://www.stubhub.com/event/{STUBHUB_EVENT_ID}',
+        f'https://www.stubhub.com/bruce-springsteen-new-york-tickets-5-11-2026/event/{STUBHUB_EVENT_ID}/',
         extra_headers={'Referer': 'https://www.stubhub.com/'}
     )
     if page:
