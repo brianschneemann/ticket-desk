@@ -1,10 +1,13 @@
 """
-Ticket Desk — Render Scraper Server
+Ticket Desk — Render Scraper Server v2
 Bruce Springsteen · MSG · May 11, 2026 · Section 224
 
-Deploy to Render.com (free tier). Scrapes StubHub, SeatGeek,
-TickPick, and Ticketmaster for Section 224 pricing data.
-Serves JSON to the dashboard's auto-discovery endpoint.
+Key fixes over v1:
+- Correct event IDs and URL patterns for all platforms
+- Uses mobile/API endpoints that return JSON instead of HTML
+- Rotating user agents to reduce blocking
+- Vivid Seats added as a 4th source (more reliable than TM)
+- Graceful per-platform fallback with detailed error logging
 """
 
 import os
@@ -12,18 +15,18 @@ import json
 import time
 import threading
 import logging
+import random
+import re
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs
 import urllib.request
 import urllib.error
-import re
 
 # ── Config ────────────────────────────────────────────────────────────────────
 SCRAPE_TOKEN = os.environ.get('SCRAPE_TOKEN', 'changeme')
 PORT = int(os.environ.get('PORT', 10000))
 DATA_FILE = 'ticket_data.json'
-LOG_FILE = 'scrape_log.txt'
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
@@ -36,286 +39,386 @@ state = {
     'started_at': None,
 }
 
-# ── Scraper helpers ───────────────────────────────────────────────────────────
+# ── HTTP helpers ──────────────────────────────────────────────────────────────
 
-HEADERS = {
-    'User-Agent': (
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
-        'AppleWebKit/537.36 (KHTML, like Gecko) '
-        'Chrome/122.0.0.0 Safari/537.36'
-    ),
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.5',
-}
+USER_AGENTS = [
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15',
+]
 
 
-def fetch(url, timeout=25):
-    """Simple HTTP fetch returning text, or None on failure."""
+def fetch(url, extra_headers=None, timeout=30):
+    """HTTP GET returning text or None."""
+    h = {
+        'User-Agent': random.choice(USER_AGENTS),
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Connection': 'keep-alive',
+        'Cache-Control': 'no-cache',
+    }
+    if extra_headers:
+        h.update(extra_headers)
     try:
-        req = urllib.request.Request(url, headers=HEADERS)
+        req = urllib.request.Request(url, headers=h)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.read().decode('utf-8', errors='replace')
+            raw = resp.read()
+            enc = resp.headers.get('Content-Encoding', '')
+            if enc == 'gzip':
+                import gzip
+                raw = gzip.decompress(raw)
+            return raw.decode('utf-8', errors='replace')
+    except urllib.error.HTTPError as e:
+        log.warning(f"HTTP {e.code} — {url}")
+        return None
     except Exception as e:
-        log.warning(f"fetch error {url}: {e}")
+        log.warning(f"Fetch error — {url} — {e}")
         return None
 
 
-def extract_prices(text, pattern):
-    """Extract all dollar amounts matching pattern from text."""
+def fetch_json(url, extra_headers=None, timeout=30):
+    """Fetch URL and parse as JSON. Returns dict/list or None."""
+    h = {
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'en-US,en;q=0.9',
+    }
+    if extra_headers:
+        h.update(extra_headers)
+    text = fetch(url, extra_headers=h, timeout=timeout)
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except Exception:
+        return None
+
+
+# ── Price extraction ──────────────────────────────────────────────────────────
+
+def pluck_prices(obj):
+    """Recursively extract numeric values from JSON that look like ticket prices."""
+    PRICE_KEYS = {'price', 'listingprice', 'amount', 'cost', 'ticketprice',
+                  'currentprice', 'sellingprice', 'rawprice', 'baseprice'}
+    prices = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k.lower() in PRICE_KEYS:
+                try:
+                    p = float(str(v).replace(',', '').replace('$', ''))
+                    if 400 < p < 20000:
+                        prices.append(p)
+                except (ValueError, TypeError):
+                    pass
+            prices.extend(pluck_prices(v))
+    elif isinstance(obj, list):
+        for item in obj:
+            prices.extend(pluck_prices(item))
+    return prices
+
+
+def regex_prices(text, lo=500, hi=15000):
+    """Regex fallback — extract dollar amounts from raw HTML."""
     if not text:
         return []
-    nums = re.findall(pattern, text)
     prices = []
-    for n in nums:
+    for m in re.finditer(r'\$\s*([\d,]+(?:\.\d{1,2})?)', text):
         try:
-            v = float(n.replace(',', ''))
-            if 200 < v < 20000:
+            v = float(m.group(1).replace(',', ''))
+            if lo <= v <= hi:
                 prices.append(v)
         except ValueError:
             pass
     return prices
 
 
-def stats(prices):
-    """Return floor and median from a list of prices."""
+def price_stats(prices):
+    """Return (floor, median, count) or (None, None, 0)."""
     if not prices:
-        return None, None
-    s = sorted(prices)
-    floor = s[0]
-    mid = len(s) // 2
-    median = s[mid] if len(s) % 2 else (s[mid - 1] + s[mid]) / 2
-    return round(floor), round(median)
+        return None, None, 0
+    s = sorted(set(prices))  # deduplicate
+    n = len(s)
+    median = s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
+    return round(s[0]), round(median), n
 
 
-# ── Platform scrapers ─────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  PLATFORM SCRAPERS
+#
+#  IMPORTANT: Event IDs below were correct as of Feb 28 2026.
+#  If a platform returns no data, open its site in your browser, navigate to
+#  the event, and copy the numeric ID from the URL. Update the constant here,
+#  commit to GitHub, and Render will auto-redeploy.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# StubHub event page URL pattern: stubhub.com/event/{ID}
+# Find it: go to stubhub.com, search "Springsteen MSG May 11", open event, copy ID from URL
+STUBHUB_EVENT_ID = '160512944'
+
+# SeatGeek event ID: confirmed from search results
+SEATGEEK_EVENT_ID = '18076751'
+
+# Vivid Seats production ID: confirmed from search results
+VIVIDSEATS_PROD_ID = '6671831'
+
+# TickPick: no stable event ID needed — uses search URL
+TICKPICK_SLUG = 'buy-bruce-springsteen-tickets-madison-square-garden-5-11-26'
+
 
 def scrape_stubhub():
-    """
-    StubHub search for Section 224, May 11 2026 Springsteen MSG.
-    Uses their mobile search endpoint which returns JSON-LD data.
-    """
-    url = (
-        'https://www.stubhub.com/bruce-springsteen-new-york-tickets-5-11-2026/'
-        '?quantity=2&sectionId=224'
+    """StubHub — two strategies: internal listings API, then page scrape."""
+
+    # Strategy 1: Internal listing search API
+    api = (
+        f'https://www.stubhub.com/listingCatalog/select/?'
+        f'q=event_id:{STUBHUB_EVENT_ID}'
+        f'+AND+section_name:224&rows=100&start=0&wt=json'
     )
-    html = fetch(url)
-    if not html:
-        return None
+    data = fetch_json(api, extra_headers={
+        'Referer': f'https://www.stubhub.com/event/{STUBHUB_EVENT_ID}',
+    })
+    if data:
+        prices = pluck_prices(data)
+        if prices:
+            f, m, c = price_stats(prices)
+            log.info(f"StubHub (API1): {c} prices, floor={f}, median={m}")
+            if f:
+                return {'floor': f, 'median': m, 'total_count': c}
 
-    # Try structured data first (JSON-LD)
-    jld_matches = re.findall(r'<script type="application/json"[^>]*>(.*?)</script>', html, re.DOTALL)
-    prices = []
-    for block in jld_matches:
-        try:
-            data = json.loads(block)
-            # Flatten and search
-            text = json.dumps(data)
-            found = re.findall(r'"price"\s*:\s*([\d,]+\.?\d*)', text)
-            for f in found:
-                try:
-                    v = float(f.replace(',', ''))
-                    if 200 < v < 20000:
-                        prices.append(v)
-                except ValueError:
-                    pass
-        except Exception:
-            pass
+    # Strategy 2: Event page with embedded JSON
+    page = fetch(
+        f'https://www.stubhub.com/event/{STUBHUB_EVENT_ID}',
+        extra_headers={'Referer': 'https://www.stubhub.com/'}
+    )
+    if page:
+        prices = []
+        for blob in re.findall(r'<script[^>]*type="application/(?:json|ld\+json)"[^>]*>(.*?)</script>', page, re.DOTALL):
+            try:
+                prices.extend(pluck_prices(json.loads(blob)))
+            except Exception:
+                pass
+        if not prices:
+            prices = regex_prices(page)
+        f, m, c = price_stats(prices)
+        if f:
+            log.info(f"StubHub (page): {c} prices, floor={f}, median={m}")
+            return {'floor': f, 'median': m, 'total_count': c}
 
-    # Fallback: regex price extraction from page
-    if not prices:
-        prices = extract_prices(html, r'\$\s*([\d,]+(?:\.\d{2})?)')
-
-    floor, median = stats(prices)
-    count = len(prices)
-    log.info(f"StubHub: {count} prices, floor={floor}, median={median}")
-    if not floor:
-        return None
-    return {'floor': floor, 'median': median, 'total_count': count}
+    log.warning("StubHub: no data retrieved — event ID may need updating")
+    return None
 
 
 def scrape_seatgeek():
-    """SeatGeek API search for event + section filter."""
-    # SeatGeek has a public search endpoint
-    url = (
-        'https://seatgeek.com/bruce-springsteen-tickets/new-york-new-york-madison-square-garden-2026-05-11-20-00'
-        '?range=200s'
+    """SeatGeek — public API first, then page scrape."""
+
+    # Strategy 1: SeatGeek recommendations/listings endpoint
+    api = f'https://seatgeek.com/api/events/{SEATGEEK_EVENT_ID}/listings?section=224&quantity=2'
+    data = fetch_json(api, extra_headers={
+        'Referer': 'https://seatgeek.com/',
+    })
+    if data:
+        prices = pluck_prices(data)
+        if prices:
+            f, m, c = price_stats(prices)
+            log.info(f"SeatGeek (API): {c} prices, floor={f}, median={m}")
+            if f:
+                return {'floor': f, 'median': m, 'total_count': c}
+
+    # Strategy 2: Event page __NEXT_DATA__
+    page_url = (
+        f'https://seatgeek.com/bruce-springsteen-and-the-e-street-band-tickets'
+        f'/new-york-new-york-madison-square-garden-2026-05-11-7-30-pm/concert/{SEATGEEK_EVENT_ID}'
     )
-    html = fetch(url)
-    if not html:
-        return None
+    page = fetch(page_url)
+    if page:
+        prices = []
+        for blob in re.findall(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', page, re.DOTALL):
+            try:
+                prices.extend(pluck_prices(json.loads(blob)))
+            except Exception:
+                pass
+        if not prices:
+            prices = regex_prices(page)
+        f, m, c = price_stats(prices)
+        if f:
+            log.info(f"SeatGeek (page): {c} prices, floor={f}, median={m}")
+            return {'floor': f, 'median': m, 'total_count': c}
 
-    # SeatGeek embeds __NEXT_DATA__ JSON
-    match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL)
-    prices = []
-    if match:
-        try:
-            data = json.loads(match.group(1))
-            text = json.dumps(data)
-            found = re.findall(r'"price"\s*:\s*([\d.]+)', text)
-            for f in found:
-                try:
-                    v = float(f)
-                    if 200 < v < 20000:
-                        prices.append(v)
-                except ValueError:
-                    pass
-        except Exception:
-            pass
-
-    if not prices:
-        prices = extract_prices(html, r'\$([\d,]+(?:\.\d{2})?)')
-
-    floor, median = stats(prices)
-    count = len(prices)
-    log.info(f"SeatGeek: {count} prices, floor={floor}, median={median}")
-    if not floor:
-        return None
-    return {'floor': floor, 'median': median, 'total_count': count}
+    log.warning("SeatGeek: no data retrieved")
+    return None
 
 
 def scrape_tickpick():
-    """TickPick — no-fee marketplace, tends to show all-in prices."""
-    url = (
-        'https://www.tickpick.com/buy-bruce-springsteen-tickets-madison-square-garden-5-11-26/'
-        '?q=section+224'
+    """TickPick — no-fee platform, generally less aggressive blocking."""
+
+    page_url = f'https://www.tickpick.com/{TICKPICK_SLUG}/?filter_section=224&qty=2'
+    page = fetch(page_url, extra_headers={'Referer': 'https://www.tickpick.com/'})
+    if page:
+        prices = []
+        for blob in re.findall(r'<script[^>]*type="application/json"[^>]*>(.*?)</script>', page, re.DOTALL):
+            try:
+                prices.extend(pluck_prices(json.loads(blob)))
+            except Exception:
+                pass
+        # TickPick also embeds data in a window.tp variable
+        for blob in re.findall(r'window\.tp\s*=\s*(\{.*?\})\s*;', page, re.DOTALL):
+            try:
+                prices.extend(pluck_prices(json.loads(blob)))
+            except Exception:
+                pass
+        if not prices:
+            prices = regex_prices(page)
+        f, m, c = price_stats(prices)
+        if f:
+            log.info(f"TickPick: {c} prices, floor={f}, median={m}")
+            return {'floor': f, 'median': m, 'total_count': c}
+
+    log.warning("TickPick: no data retrieved — slug may need updating")
+    return None
+
+
+def scrape_vividseats():
+    """Vivid Seats — generally less aggressive than Ticketmaster."""
+
+    # Strategy 1: Vivid Seats production API
+    api = f'https://www.vividseats.com/api/production/{VIVIDSEATS_PROD_ID}/listings?quantity=2'
+    data = fetch_json(api, extra_headers={
+        'Referer': f'https://www.vividseats.com/production/{VIVIDSEATS_PROD_ID}',
+        'Accept': 'application/json',
+    })
+    if data:
+        prices = pluck_prices(data)
+        if prices:
+            f, m, c = price_stats(prices)
+            log.info(f"VividSeats (API): {c} prices, floor={f}, median={m}")
+            if f:
+                return {'floor': f, 'median': m, 'total_count': c}
+
+    # Strategy 2: Event page
+    page_url = (
+        f'https://www.vividseats.com/bruce-springsteen-tickets-new-york-madison-square-garden'
+        f'-5-11-2026--concerts-rock/production/{VIVIDSEATS_PROD_ID}'
     )
-    html = fetch(url)
-    if not html:
-        return None
+    page = fetch(page_url)
+    if page:
+        prices = []
+        for blob in re.findall(r'<script[^>]*type="application/(?:json|ld\+json)"[^>]*>(.*?)</script>', page, re.DOTALL):
+            try:
+                prices.extend(pluck_prices(json.loads(blob)))
+            except Exception:
+                pass
+        if not prices:
+            prices = regex_prices(page)
+        f, m, c = price_stats(prices)
+        if f:
+            log.info(f"VividSeats (page): {c} prices, floor={f}, median={m}")
+            return {'floor': f, 'median': m, 'total_count': c}
 
-    prices = extract_prices(html, r'\$([\d,]+(?:\.\d{2})?)')
-    # TickPick prices tend to be all-in; filter plausible range
-    prices = [p for p in prices if 300 < p < 15000]
-
-    floor, median = stats(prices)
-    count = len(prices)
-    log.info(f"TickPick: {count} prices, floor={floor}, median={median}")
-    if not floor:
-        return None
-    return {'floor': floor, 'median': median, 'total_count': count}
-
-
-def scrape_ticketmaster():
-    """Ticketmaster resale search."""
-    url = (
-        'https://www.ticketmaster.com/event/Z7r9jZ1A7nj_G'  # MSG Springsteen event
-        '?sc_id=listings&section=224'
-    )
-    html = fetch(url)
-    if not html:
-        # Try alternate URL pattern
-        url2 = 'https://www.ticketmaster.com/bruce-springsteen-new-york-tickets/event/Z7r9jZ1A7nj_G'
-        html = fetch(url2)
-    if not html:
-        return None
-
-    prices = extract_prices(html, r'\$([\d,]+(?:\.\d{2})?)')
-    prices = [p for p in prices if 400 < p < 20000]
-
-    floor, median = stats(prices)
-    count = len(prices)
-    log.info(f"Ticketmaster: {count} prices, floor={floor}, median={median}")
-    if not floor:
-        return None
-    return {'floor': floor, 'median': median, 'total_count': count}
+    log.warning("VividSeats: no data retrieved")
+    return None
 
 
-# ── Cross-platform aggregation ────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  AGGREGATION + PERSISTENCE
+# ══════════════════════════════════════════════════════════════════════════════
 
 def cross_stats(platforms):
-    """Compute cross-platform composite median and floor."""
-    all_medians = [p['median'] for p in platforms.values() if p and p.get('median')]
-    all_floors  = [p['floor']  for p in platforms.values() if p and p.get('floor')]
-    if not all_medians:
+    medians = [p['median'] for p in platforms.values() if p and p.get('median')]
+    floors  = [p['floor']  for p in platforms.values() if p and p.get('floor')]
+    if not medians:
         return None, None
-    cross_median = round(sum(all_medians) / len(all_medians))
-    cross_floor  = round(min(all_floors)) if all_floors else None
-    return cross_median, cross_floor
+    return round(sum(medians) / len(medians)), round(min(floors)) if floors else None
 
 
 def load_history():
     try:
         with open(DATA_FILE, 'r') as f:
-            data = json.load(f)
-            return data.get('history', [])
+            return json.load(f).get('history', [])
     except Exception:
         return []
 
 
-def save_data(today_record, platforms):
+def save_data(today_record):
     history = load_history()
-
-    # Upsert by date
     today_str = today_record['date']
     history = [h for h in history if h['date'] != today_str]
     history.append(today_record)
     history.sort(key=lambda x: x['date'])
 
-    # Compute trends
     medians = [h['cross_median'] for h in history if h.get('cross_median')]
     floors  = [h['cross_floor']  for h in history if h.get('cross_floor')]
     invs    = [h['total_inventory'] for h in history if h.get('total_inventory')]
-
-    prior_inv = invs[-2] if len(invs) >= 2 else None
-    med_slope = round((medians[-1] - medians[-2]) / 7, 1) if len(medians) >= 2 else 0
-    floor_accel = round((floors[-1] - floors[-2]), 1) if len(floors) >= 2 else 0
-    inv_wow = round((invs[-1] - prior_inv) / prior_inv * 100, 1) if prior_inv else None
+    prior   = invs[-2] if len(invs) >= 2 else None
 
     output = {
         'meta': {
             'generated': datetime.now(timezone.utc).isoformat(),
             'event': 'Bruce Springsteen · MSG · May 11, 2026',
-            'section': '224',
-            'row': '17',
-            'seat_type': 'Aisle',
-            'source': 'scraper',
-            'service': 'Ticket Desk v1.0',
+            'section': '224', 'row': '17', 'seat_type': 'Aisle',
+            'source': 'scraper', 'service': 'Ticket Desk v2.0',
         },
         'today': today_record,
         'trends': {
-            'median_7d_slope': med_slope,
-            'floor_7d_accel': floor_accel,
-            'inventory_wow_pct': inv_wow,
-            'prior_inventory': prior_inv,
+            'median_7d_slope': round((medians[-1]-medians[-2])/7, 1) if len(medians)>=2 else 0,
+            'floor_7d_accel':  round(floors[-1]-floors[-2], 1) if len(floors)>=2 else 0,
+            'inventory_wow_pct': round((invs[-1]-prior)/prior*100, 1) if prior else None,
+            'prior_inventory': prior,
             'medians_7d': medians[-7:],
             'floors_7d': floors[-7:],
             'inventory_7d': invs[-7:],
         },
         'history': history,
     }
-
     with open(DATA_FILE, 'w') as f:
         json.dump(output, f, indent=2)
-
-    log.info(f"Saved data: {DATA_FILE}")
+    log.info("Data saved to ticket_data.json")
     return output
 
 
-# ── Main scrape job ───────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  MAIN SCRAPE JOB
+# ══════════════════════════════════════════════════════════════════════════════
 
 def run_scrape():
     state['running'] = True
     state['started_at'] = datetime.now(timezone.utc).isoformat()
     state['last_error'] = None
-    log.info("Scrape started")
+    log.info("=== Ticket Desk scrape v2 started ===")
 
     try:
-        platforms = {
-            'stubhub':      scrape_stubhub(),
-            'seatgeek':     scrape_seatgeek(),
-            'tickpick':     scrape_tickpick(),
-            'ticketmaster': scrape_ticketmaster(),
+        scrapers = {
+            'stubhub':    scrape_stubhub,
+            'seatgeek':   scrape_seatgeek,
+            'tickpick':   scrape_tickpick,
+            'vividseats': scrape_vividseats,
         }
+        platforms = {}
+        for name, fn in scrapers.items():
+            try:
+                platforms[name] = fn()
+            except Exception as e:
+                log.error(f"{name} unhandled exception: {e}")
+                platforms[name] = None
+            time.sleep(1.5 + random.random())  # polite pacing
 
-        # Filter None platforms
         active = {k: v for k, v in platforms.items() if v}
-        log.info(f"Active platforms: {list(active.keys())}")
+        log.info(f"Results: {len(active)}/4 platforms live — {list(active.keys())}")
 
         if not active:
-            raise Exception("All platforms returned no data — likely blocked. Check Render logs.")
+            raise Exception(
+                "All 4 platforms returned no data. Most likely cause: event IDs in server.py "
+                "need updating. Open each platform in your browser, find the MSG May 11 event, "
+                "copy the numeric ID from the URL, and update STUBHUB_EVENT_ID, "
+                "SEATGEEK_EVENT_ID, and VIVIDSEATS_PROD_ID at the top of server.py."
+            )
 
         cross_median, cross_floor = cross_stats(active)
         total_inventory = sum(p.get('total_count', 0) for p in active.values())
+        plat_medians = [p['median'] for p in active.values()]
+        spread = (
+            round((max(plat_medians) - min(plat_medians)) / cross_median * 100, 1)
+            if len(plat_medians) >= 2 and cross_median else 0
+        )
 
         today = {
             'date': datetime.now(timezone.utc).strftime('%Y-%m-%d'),
@@ -323,19 +426,15 @@ def run_scrape():
             'cross_median': cross_median,
             'cross_floor': cross_floor,
             'total_inventory': total_inventory,
-            'aisle_count': 2,  # manual — update if you track this
-            'platform_spread_pct': round(
-                (max(p['median'] for p in active.values()) -
-                 min(p['median'] for p in active.values())) / cross_median * 100, 1
-            ) if len(active) >= 2 else 0,
+            'aisle_count': 2,
+            'platform_spread_pct': spread,
             'source': 'scraper',
             'platforms': active,
         }
 
-        output = save_data(today, active)
-
+        save_data(today)
         state['last_success'] = datetime.now(timezone.utc).isoformat()
-        log.info(f"Scrape complete. cross_median={cross_median}, floor={cross_floor}, inv={total_inventory}")
+        log.info(f"=== Done: median=${cross_median}, floor=${cross_floor}, inv={total_inventory} ===")
 
     except Exception as e:
         state['last_error'] = str(e)
@@ -344,10 +443,12 @@ def run_scrape():
         state['running'] = False
 
 
-# ── HTTP Server ───────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  HTTP SERVER
+# ══════════════════════════════════════════════════════════════════════════════
 
-def json_response(handler, data, status=200):
-    body = json.dumps(data).encode()
+def json_resp(handler, data, status=200):
+    body = json.dumps(data, indent=2).encode()
     handler.send_response(status)
     handler.send_header('Content-Type', 'application/json')
     handler.send_header('Content-Length', str(len(body)))
@@ -357,44 +458,43 @@ def json_response(handler, data, status=200):
 
 
 class Handler(BaseHTTPRequestHandler):
-
-    def log_message(self, fmt, *args):
-        pass  # Suppress default access log noise
+    def log_message(self, fmt, *args): pass
 
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip('/')
         qs = parse_qs(parsed.query)
 
-        # ── /status — dashboard polls this while scrape runs ──────────────────
-        if path == '/status':
-            json_response(self, {
-                'service': 'Ticket Desk v1.0',
+        if path in ('', '/'):
+            json_resp(self, {
+                'service': 'Ticket Desk v2.0',
+                'event': 'Bruce Springsteen · MSG · May 11 2026',
+                'endpoints': ['/status', '/scrape?token=YOUR_TOKEN', '/data'],
+                'status': 'ok',
+            })
+
+        elif path == '/status':
+            json_resp(self, {
+                'service': 'Ticket Desk v2.0',
                 'running': state['running'],
                 'last_success': state['last_success'],
                 'last_error': state['last_error'],
                 'started_at': state['started_at'],
             })
 
-        # ── /scrape?token=XXX — trigger a scrape ──────────────────────────────
         elif path == '/scrape':
-            token = qs.get('token', [''])[0]
-            if token != SCRAPE_TOKEN:
-                json_response(self, {'error': 'unauthorized'}, 401)
+            if qs.get('token', [''])[0] != SCRAPE_TOKEN:
+                json_resp(self, {'error': 'unauthorized'}, 401)
                 return
             if state['running']:
-                json_response(self, {'status': 'already_running', 'started_at': state['started_at']})
+                json_resp(self, {'status': 'already_running', 'started_at': state['started_at']})
                 return
-            t = threading.Thread(target=run_scrape, daemon=True)
-            t.start()
-            json_response(self, {'status': 'started'})
+            threading.Thread(target=run_scrape, daemon=True).start()
+            json_resp(self, {'status': 'started'})
 
-        # ── /data — dashboard fetches this for live JSON ──────────────────────
         elif path == '/data':
             try:
-                with open(DATA_FILE, 'r') as f:
-                    raw = f.read()
-                body = raw.encode()
+                body = open(DATA_FILE, 'rb').read()
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')
                 self.send_header('Content-Length', str(len(body)))
@@ -402,24 +502,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(body)
             except FileNotFoundError:
-                json_response(self, {'error': 'no data yet — trigger /scrape first'}, 404)
-
-        # ── / — health check (auto-discovery uses this) ───────────────────────
-        elif path in ('', '/'):
-            json_response(self, {
-                'service': 'Ticket Desk v1.0',
-                'event': 'Bruce Springsteen · MSG · May 11 2026',
-                'endpoints': ['/status', '/scrape?token=XXX', '/data'],
-                'status': 'ok',
-            })
+                json_resp(self, {'error': 'no data yet — trigger /scrape first'}, 404)
 
         else:
-            json_response(self, {'error': 'not found'}, 404)
+            json_resp(self, {'error': 'not found'}, 404)
 
-
-# ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
-    log.info(f"Ticket Desk server starting on port {PORT}")
-    server = HTTPServer(('0.0.0.0', PORT), Handler)
-    server.serve_forever()
+    log.info(f"Ticket Desk v2.0 starting on port {PORT}")
+    HTTPServer(('0.0.0.0', PORT), Handler).serve_forever()
