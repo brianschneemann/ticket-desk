@@ -7,7 +7,7 @@ services:
     envVars:
       - key: SCRAPE_TOKEN
         generateValue: false
-        value: "boss2026sec224"   # ← CHANGE THIS to something unique before deploying
+        value: "bruce11may2026"   # ← CHANGE THIS to something unique before deploying
       - key: PORT
         value: "10000"
     plan: free
