@@ -32,7 +32,7 @@ TICKPICK_EVENT_ID  = '7742380'
 TICKPICK_SLUG      = 'buy-bruce-springsteen-the-e-street-band-tickets-madison-square-garden-5-11-26-7pm'
 
 # 200-level price sanity bounds
-PRICE_MIN = 800
+PRICE_MIN = 500
 PRICE_MAX = 12000
 
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
