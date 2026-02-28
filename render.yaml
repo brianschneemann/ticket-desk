@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: ticket-desk
+    runtime: python
+    buildCommand: "echo 'No build step needed'"
+    startCommand: "python server.py"
+    envVars:
+      - key: SCRAPE_TOKEN
+        generateValue: false
+        value: "boss2026sec224"   # ← CHANGE THIS to something unique before deploying
+      - key: PORT
+        value: "10000"
+    plan: free
+    healthCheckPath: /

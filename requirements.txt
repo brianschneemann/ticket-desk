@@ -1,0 +1,3 @@
+# No third-party dependencies — server.py uses only Python stdlib.
+# This file exists to signal to Render that this is a Python project.
+# Python 3.11+ is used automatically on Render free tier.
