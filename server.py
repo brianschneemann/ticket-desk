@@ -32,7 +32,7 @@ TICKPICK_EVENT_ID  = '7742380'
 TICKPICK_SLUG      = 'buy-bruce-springsteen-the-e-street-band-tickets-madison-square-garden-5-11-26-7pm'
 
 # 200-level price sanity bounds
-PRICE_MIN = 500
+PRICE_MIN = 800
 PRICE_MAX = 12000
 
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
@@ -172,70 +172,50 @@ def scrape_seatgeek():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  TICKPICK — confirmed event ID 7742380
+#  TICKPICK — relay only (JS-rendered, cannot scrape from server)
+#  Use relay form: open tickpick.com/...7742380/, filter to sec 224,
+#  enter floor + median in the relay form at /relay-form?token=YOUR_TOKEN
 # ══════════════════════════════════════════════════════════════════════════════
 def scrape_tickpick():
-    log.info("TickPick: fetching confirmed event page...")
-
-    # Primary: direct event page with confirmed slug
-    url = f'https://www.tickpick.com/{TICKPICK_SLUG}/{TICKPICK_EVENT_ID}/'
-    page = fetch(url, headers={'Referer': 'https://www.tickpick.com/'})
-    if page:
-        prices = []
-        for blob in re.findall(r'<script[^>]*type="application/json"[^>]*>(.*?)</script>', page, re.DOTALL):
-            try: prices.extend(pluck(json.loads(blob)))
-            except: pass
-        for blob in re.findall(r'<script[^>]*>(.*?)</script>', page, re.DOTALL):
-            if 'listing' in blob.lower() or 'price' in blob.lower():
-                try: prices.extend(pluck(json.loads(blob)))
-                except: pass
-        if not prices:
-            prices = regex_p(page)
-        f, m, c = pstats(prices)
-        if f:
-            return ok(f, m, c, 'TickPick page')
-
-    # Fallback: TickPick listing API with confirmed event ID
-    api_url = f'https://www.tickpick.com/api/listings/?event={TICKPICK_EVENT_ID}&section=224&qty=2&sortby=p'
-    data = fetch_json(api_url, headers={
-        'Referer': f'https://www.tickpick.com/{TICKPICK_SLUG}/{TICKPICK_EVENT_ID}/',
-        'Origin': 'https://www.tickpick.com',
-        'X-Requested-With': 'XMLHttpRequest',
-    })
-    if data:
-        prices = pluck(data)
-        f, m, c = pstats(prices)
-        if f:
-            return ok(f, m, c, 'TickPick API')
-
-    log.warning("TickPick: no data — page may require JS rendering")
+    log.info("TickPick: checking relay cache...")
+    try:
+        with open(RELAY_FILE) as f:
+            relay = json.load(f)
+        tp = relay.get('tickpick', {})
+        if tp.get('date') == datetime.now(timezone.utc).strftime('%Y-%m-%d'):
+            f2, m2, c2 = tp.get('floor'), tp.get('median'), tp.get('count', 1)
+            if f2 and m2:
+                log.info(f"  ✓ TickPick (relay): floor=${f2} | median=${m2}")
+                return {'floor': f2, 'median': m2, 'total_count': c2}
+        log.info("TickPick: relay data stale or missing — use /relay-form")
+    except FileNotFoundError:
+        log.info("TickPick: no relay file yet — use /relay-form")
+    except Exception as e:
+        log.warning(f"TickPick relay error: {e}")
     return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  VIVID SEATS — working in v3 with price filter, unchanged
+#  VIVID SEATS — relay only (page scrape pulls all sections, not 224-specific)
+#  Use relay form: open vividseats.com/production/6671831, filter to sec 224,
+#  enter floor + median in the relay form at /relay-form?token=YOUR_TOKEN
 # ══════════════════════════════════════════════════════════════════════════════
 def scrape_vividseats():
-    log.info("VividSeats: fetching...")
-    page_url = (
-        f'https://www.vividseats.com/bruce-springsteen-tickets-new-york-madison-square-garden'
-        f'-5-11-2026--concerts-rock/production/{VIVIDSEATS_PROD_ID}'
-    )
-    page = fetch(page_url, headers={'Referer': 'https://www.vividseats.com/'})
-    if page:
-        prices = []
-        for blob in re.findall(r'<script[^>]*type="application/(?:json|ld\+json)"[^>]*>(.*?)</script>', page, re.DOTALL):
-            try: prices.extend(pluck(json.loads(blob)))
-            except: pass
-        for blob in re.findall(r'window\.__PRELOADED_STATE__\s*=\s*(\{.*?\})\s*;', page, re.DOTALL):
-            try: prices.extend(pluck(json.loads(blob)))
-            except: pass
-        if not prices:
-            prices = regex_p(page)
-        f, m, c = pstats(prices)
-        if f:
-            return ok(f, m, c, 'VividSeats')
-    log.warning("VividSeats: no data")
+    log.info("VividSeats: checking relay cache...")
+    try:
+        with open(RELAY_FILE) as f:
+            relay = json.load(f)
+        vs = relay.get('vividseats', {})
+        if vs.get('date') == datetime.now(timezone.utc).strftime('%Y-%m-%d'):
+            f2, m2, c2 = vs.get('floor'), vs.get('median'), vs.get('count', 1)
+            if f2 and m2:
+                log.info(f"  ✓ VividSeats (relay): floor=${f2} | median=${m2}")
+                return {'floor': f2, 'median': m2, 'total_count': c2}
+        log.info("VividSeats: relay data stale or missing — use /relay-form")
+    except FileNotFoundError:
+        log.info("VividSeats: no relay file yet — use /relay-form")
+    except Exception as e:
+        log.warning(f"VividSeats relay error: {e}")
     return None
 
 
