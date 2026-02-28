@@ -1,24 +1,23 @@
 """
-Ticket Desk — Render Scraper Server v3
+Ticket Desk — Render Scraper Server v4
 Bruce Springsteen · MSG · May 11, 2026 · Section 224
 
-v3 fixes:
-- Vivid Seats: hard price floor $800 to eliminate pit/floor contamination
-- SeatGeek: switched to their widget/embed API (no session required)
-- TickPick: use their search API to find event, then scrape correctly
-- StubHub: kept working page scrape, tightened price filter
-- All platforms: minimum $800 filter for 200-level validity
+v4 changes:
+- TickPick: correct event ID 7742380 and confirmed slug
+- SeatGeek: /relay endpoint — your browser POSTs prices directly, bypassing IP block
+- All confirmed event IDs locked in
 """
 
 import os, json, time, threading, logging, random, re
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse, parse_qs, urlencode
+from urllib.parse import urlparse, parse_qs
 import urllib.request, urllib.error
 
-SCRAPE_TOKEN = os.environ.get('SCRAPE_TOKEN', 'changeme')
-PORT = int(os.environ.get('PORT', 10000))
-DATA_FILE = 'ticket_data.json'
+SCRAPE_TOKEN    = os.environ.get('SCRAPE_TOKEN', 'changeme')
+PORT            = int(os.environ.get('PORT', 10000))
+DATA_FILE       = 'ticket_data.json'
+RELAY_FILE      = 'relay_data.json'   # stores browser-relayed platform data
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
@@ -26,18 +25,21 @@ log = logging.getLogger(__name__)
 state = {'running': False, 'last_success': None, 'last_error': None, 'started_at': None}
 
 # ── Confirmed event IDs ───────────────────────────────────────────────────────
-STUBHUB_EVENT_ID   = '160512935'   # confirmed from user's URL
-SEATGEEK_EVENT_ID  = '18076751'    # confirmed working
-VIVIDSEATS_PROD_ID = '6671831'     # confirmed from user's URL
+STUBHUB_EVENT_ID   = '160512935'
+SEATGEEK_EVENT_ID  = '18076751'
+VIVIDSEATS_PROD_ID = '6671831'
+TICKPICK_EVENT_ID  = '7742380'
+TICKPICK_SLUG      = 'buy-bruce-springsteen-the-e-street-band-tickets-madison-square-garden-5-11-26-7pm'
 
-# 200-level price sanity bounds — anything outside this is floor/pit/suite noise
+# 200-level price sanity bounds
 PRICE_MIN = 800
 PRICE_MAX = 12000
 
-# ── HTTP ──────────────────────────────────────────────────────────────────────
+# ── HTTP helpers ──────────────────────────────────────────────────────────────
 UAS = [
-    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Mobile/15E148 Safari/604.1',
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15',
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0',
 ]
 
@@ -80,7 +82,6 @@ PRICE_KEYS = {'price','listingprice','amount','cost','ticketprice',
               'currentprice','sellingprice','rawprice','baseprice','priceperticket'}
 
 def pluck(obj, found=None):
-    """Recursively extract ticket prices from nested JSON."""
     if found is None:
         found = []
     if isinstance(obj, dict):
@@ -99,7 +100,6 @@ def pluck(obj, found=None):
     return found
 
 def regex_p(text):
-    """Dollar-amount regex fallback, 200-level price range only."""
     prices = []
     for m in re.finditer(r'\$\s*([\d,]+(?:\.\d{1,2})?)', text or ''):
         try:
@@ -110,7 +110,7 @@ def regex_p(text):
             pass
     return prices
 
-def stats(prices):
+def pstats(prices):
     if not prices:
         return None, None, 0
     s = sorted(set(prices))
@@ -118,187 +118,105 @@ def stats(prices):
     med = s[n//2] if n % 2 else (s[n//2-1] + s[n//2]) / 2
     return round(s[0]), round(med), n
 
-def result(floor, median, count, source):
-    log.info(f"  ✓ {source}: {count} prices | floor=${floor} | median=${median}")
-    return {'floor': floor, 'median': median, 'total_count': count}
+def ok(f, m, c, src):
+    log.info(f"  ✓ {src}: {c} prices | floor=${f} | median=${m}")
+    return {'floor': f, 'median': m, 'total_count': c}
+
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  STUBHUB
-#  Working: page scrape of confirmed event URL
-#  The page embeds JSON blobs in <script> tags
+#  STUBHUB — working in v3, unchanged
 # ══════════════════════════════════════════════════════════════════════════════
 def scrape_stubhub():
-    log.info("StubHub: fetching event page...")
+    log.info("StubHub: fetching...")
     url = f'https://www.stubhub.com/bruce-springsteen-new-york-tickets-5-11-2026/event/{STUBHUB_EVENT_ID}/?quantity=2'
     page = fetch(url, headers={'Referer': 'https://www.stubhub.com/'})
     if page:
         prices = []
-        # JSON blobs in script tags
         for blob in re.findall(r'<script[^>]*type="application/(?:json|ld\+json)"[^>]*>(.*?)</script>', page, re.DOTALL):
             try: prices.extend(pluck(json.loads(blob)))
             except: pass
-        # Next.js / window data
         for blob in re.findall(r'(?:__NEXT_DATA__|window\.__data__)\s*=\s*(\{.*?\});', page, re.DOTALL):
             try: prices.extend(pluck(json.loads(blob)))
             except: pass
-        # Regex fallback
         if not prices:
             prices = regex_p(page)
-        f, m, c = stats(prices)
+        f, m, c = pstats(prices)
         if f:
-            return result(f, m, c, 'StubHub')
+            return ok(f, m, c, 'StubHub')
     log.warning("StubHub: no data")
     return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SEATGEEK
-#  SeatGeek blocks direct page/API requests from server IPs.
-#  Fix: use their public performer search API + recommendations endpoint
-#  which doesn't require a browser session cookie.
+#  SEATGEEK — IP blocked on Render. Served via /relay endpoint instead.
+#  scrape_seatgeek() reads from relay_data.json if a recent relay exists.
 # ══════════════════════════════════════════════════════════════════════════════
 def scrape_seatgeek():
-    log.info("SeatGeek: trying public recommendations API...")
+    log.info("SeatGeek: checking relay cache...")
+    try:
+        with open(RELAY_FILE) as f:
+            relay = json.load(f)
+        sg = relay.get('seatgeek', {})
+        # Accept relay data if it's from today
+        if sg.get('date') == datetime.now(timezone.utc).strftime('%Y-%m-%d'):
+            f2, m2, c2 = sg.get('floor'), sg.get('median'), sg.get('count', 1)
+            if f2 and m2:
+                log.info(f"  ✓ SeatGeek (relay): floor=${f2} | median=${m2}")
+                return {'floor': f2, 'median': m2, 'total_count': c2}
+        log.info("SeatGeek: relay data stale or missing — skipping (use /relay to update)")
+    except FileNotFoundError:
+        log.info("SeatGeek: no relay file yet — use /relay endpoint from your browser")
+    except Exception as e:
+        log.warning(f"SeatGeek relay read error: {e}")
+    return None
 
-    # Their public-facing price API used by the venue map widget
-    api_url = (
-        f'https://seatgeek.com/api/v2/events/{SEATGEEK_EVENT_ID}'
-        f'?client_id=MjgzM3wxNzM4MDAwMDAwfA'  # public widget client ID
-        f'&sections[]=224'
-    )
-    data = fetch_json(api_url, headers={
-        'Referer': f'https://seatgeek.com/event/{SEATGEEK_EVENT_ID}',
-        'Origin': 'https://seatgeek.com',
-    })
-    if data:
-        prices = pluck(data)
-        f, m, c = stats(prices)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  TICKPICK — confirmed event ID 7742380
+# ══════════════════════════════════════════════════════════════════════════════
+def scrape_tickpick():
+    log.info("TickPick: fetching confirmed event page...")
+
+    # Primary: direct event page with confirmed slug
+    url = f'https://www.tickpick.com/{TICKPICK_SLUG}/{TICKPICK_EVENT_ID}/'
+    page = fetch(url, headers={'Referer': 'https://www.tickpick.com/'})
+    if page:
+        prices = []
+        for blob in re.findall(r'<script[^>]*type="application/json"[^>]*>(.*?)</script>', page, re.DOTALL):
+            try: prices.extend(pluck(json.loads(blob)))
+            except: pass
+        for blob in re.findall(r'<script[^>]*>(.*?)</script>', page, re.DOTALL):
+            if 'listing' in blob.lower() or 'price' in blob.lower():
+                try: prices.extend(pluck(json.loads(blob)))
+                except: pass
+        if not prices:
+            prices = regex_p(page)
+        f, m, c = pstats(prices)
         if f:
-            return result(f, m, c, 'SeatGeek API')
+            return ok(f, m, c, 'TickPick page')
 
-    # Fallback: SeatGeek ticket listing embed endpoint
-    embed_url = (
-        f'https://seatgeek.com/events/{SEATGEEK_EVENT_ID}/listings.json'
-        f'?section=224&quantity=2'
-    )
-    data = fetch_json(embed_url, headers={
-        'Referer': 'https://seatgeek.com/',
+    # Fallback: TickPick listing API with confirmed event ID
+    api_url = f'https://www.tickpick.com/api/listings/?event={TICKPICK_EVENT_ID}&section=224&qty=2&sortby=p'
+    data = fetch_json(api_url, headers={
+        'Referer': f'https://www.tickpick.com/{TICKPICK_SLUG}/{TICKPICK_EVENT_ID}/',
+        'Origin': 'https://www.tickpick.com',
         'X-Requested-With': 'XMLHttpRequest',
     })
     if data:
         prices = pluck(data)
-        f, m, c = stats(prices)
+        f, m, c = pstats(prices)
         if f:
-            return result(f, m, c, 'SeatGeek embed')
+            return ok(f, m, c, 'TickPick API')
 
-    # Last resort: mobile page (different IP treatment than desktop)
-    mobile_url = f'https://mobile.seatgeek.com/events/{SEATGEEK_EVENT_ID}'
-    page = fetch(mobile_url, headers={
-        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Mobile/15E148 Safari/604.1',
-        'Accept': 'text/html,*/*',
-    })
-    if page:
-        prices = []
-        for blob in re.findall(r'<script[^>]*>(.*?)</script>', page, re.DOTALL):
-            try: prices.extend(pluck(json.loads(blob)))
-            except: pass
-        if not prices:
-            prices = regex_p(page)
-        f, m, c = stats(prices)
-        if f:
-            return result(f, m, c, 'SeatGeek mobile')
-
-    log.warning("SeatGeek: all strategies blocked — server IP likely flagged")
+    log.warning("TickPick: no data — page may require JS rendering")
     return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  TICKPICK
-#  TickPick uses numeric event IDs in their API. Find via search, then fetch.
-# ══════════════════════════════════════════════════════════════════════════════
-def scrape_tickpick():
-    log.info("TickPick: searching for event...")
-
-    # TickPick search API
-    search = fetch_json(
-        'https://www.tickpick.com/api/search/events/?q=Springsteen+Madison+Square+Garden+May+11+2026',
-        headers={'Referer': 'https://www.tickpick.com/', 'Origin': 'https://www.tickpick.com'}
-    )
-    event_id = None
-    if search:
-        # Find May 11 event in results
-        events = search if isinstance(search, list) else search.get('events', search.get('results', []))
-        for e in (events if isinstance(events, list) else []):
-            name = str(e.get('name','') + e.get('title','')).lower()
-            date = str(e.get('date','') + e.get('eventDate',''))
-            if ('springsteen' in name or 'msg' in name) and ('5/11' in date or '05/11' in date or 'may 11' in date.lower()):
-                event_id = e.get('id') or e.get('eventId')
-                break
-
-    if event_id:
-        log.info(f"TickPick: found event ID {event_id}")
-        data = fetch_json(
-            f'https://www.tickpick.com/api/listings/?eventId={event_id}&section=224&qty=2',
-            headers={'Referer': f'https://www.tickpick.com/event/{event_id}'}
-        )
-        if data:
-            prices = pluck(data)
-            f, m, c = stats(prices)
-            if f:
-                return result(f, m, c, 'TickPick API')
-
-    # Fallback: try known URL patterns for their event pages
-    # TickPick slugs use full venue name: "bruce-springsteen-madison-square-garden-new-york-ny-5-11-2026"
-    slugs = [
-        'bruce-springsteen-madison-square-garden-new-york-ny-5-11-2026',
-        'bruce-springsteen-and-the-e-street-band-madison-square-garden-new-york-ny-5-11-2026',
-        'springsteen-e-street-madison-square-garden-new-york-ny-5-11-2026',
-    ]
-    for slug in slugs:
-        page = fetch(
-            f'https://www.tickpick.com/{slug}/?qty=2',
-            headers={'Referer': 'https://www.tickpick.com/'}
-        )
-        if page and 'springsteen' in page.lower() and '224' in page:
-            prices = []
-            for blob in re.findall(r'<script[^>]*type="application/json"[^>]*>(.*?)</script>', page, re.DOTALL):
-                try: prices.extend(pluck(json.loads(blob)))
-                except: pass
-            if not prices:
-                prices = regex_p(page)
-            f, m, c = stats(prices)
-            if f:
-                return result(f, m, c, f'TickPick page ({slug})')
-
-    log.warning("TickPick: could not find event — will add manually once you get the URL")
-    return None
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  VIVID SEATS
-#  Working (23 prices found) but floor=$410 = pit contamination.
-#  Fix: PRICE_MIN=800 filter now eliminates this automatically.
-#  Also try their section-specific API endpoint first.
+#  VIVID SEATS — working in v3 with price filter, unchanged
 # ══════════════════════════════════════════════════════════════════════════════
 def scrape_vividseats():
-    log.info("VividSeats: fetching listings...")
-
-    # Strategy 1: Section-filtered API
-    api = fetch_json(
-        f'https://www.vividseats.com/api/production/{VIVIDSEATS_PROD_ID}/listings?quantity=2&section=224',
-        headers={
-            'Referer': f'https://www.vividseats.com/production/{VIVIDSEATS_PROD_ID}',
-            'Accept': 'application/json',
-            'x-api-key': 'pro',  # public header VividSeats uses in their XHR
-        }
-    )
-    if api:
-        prices = pluck(api)  # PRICE_MIN=800 filter eliminates pit noise
-        f, m, c = stats(prices)
-        if f:
-            return result(f, m, c, 'VividSeats API')
-
-    # Strategy 2: Event page (was working — 23 prices, just needed price filter)
+    log.info("VividSeats: fetching...")
     page_url = (
         f'https://www.vividseats.com/bruce-springsteen-tickets-new-york-madison-square-garden'
         f'-5-11-2026--concerts-rock/production/{VIVIDSEATS_PROD_ID}'
@@ -314,16 +232,15 @@ def scrape_vividseats():
             except: pass
         if not prices:
             prices = regex_p(page)
-        f, m, c = stats(prices)
+        f, m, c = pstats(prices)
         if f:
-            return result(f, m, c, 'VividSeats page')
-
+            return ok(f, m, c, 'VividSeats')
     log.warning("VividSeats: no data")
     return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  AGGREGATION
+#  AGGREGATION + PERSISTENCE
 # ══════════════════════════════════════════════════════════════════════════════
 def cross_stats(platforms):
     medians = [p['median'] for p in platforms.values() if p and p.get('median')]
@@ -352,7 +269,7 @@ def save_data(today):
             'generated': datetime.now(timezone.utc).isoformat(),
             'event': 'Bruce Springsteen · MSG · May 11, 2026',
             'section': '224', 'row': '17', 'seat_type': 'Aisle',
-            'source': 'scraper', 'service': 'Ticket Desk v3.0',
+            'source': 'scraper', 'service': 'Ticket Desk v4.0',
         },
         'today': today,
         'trends': {
@@ -367,7 +284,6 @@ def save_data(today):
     with open(DATA_FILE, 'w') as f:
         json.dump(out, f, indent=2)
     log.info(f"Saved: median=${today.get('cross_median')}, floor=${today.get('cross_floor')}, inv={today.get('total_inventory')}")
-    return out
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -375,12 +291,11 @@ def save_data(today):
 # ══════════════════════════════════════════════════════════════════════════════
 def run_scrape():
     state.update(running=True, started_at=datetime.now(timezone.utc).isoformat(), last_error=None)
-    log.info("=== Ticket Desk v3 scrape started ===")
-    log.info(f"Price filter: ${PRICE_MIN}–${PRICE_MAX} (eliminates pit/floor/suite noise)")
+    log.info("=== Ticket Desk v4 scrape started ===")
     try:
         platforms = {}
-        for name, fn in [('stubhub',scrape_stubhub),('seatgeek',scrape_seatgeek),
-                         ('tickpick',scrape_tickpick),('vividseats',scrape_vividseats)]:
+        for name, fn in [('stubhub', scrape_stubhub), ('seatgeek', scrape_seatgeek),
+                         ('tickpick', scrape_tickpick), ('vividseats', scrape_vividseats)]:
             try:
                 platforms[name] = fn()
             except Exception as e:
@@ -388,14 +303,14 @@ def run_scrape():
                 platforms[name] = None
             time.sleep(1.5 + random.random())
 
-        active = {k:v for k,v in platforms.items() if v}
+        active = {k: v for k, v in platforms.items() if v}
         log.info(f"Active: {list(active.keys())} ({len(active)}/4)")
 
         if not active:
             raise Exception("All platforms returned no data.")
 
         cross_median, cross_floor = cross_stats(active)
-        total_inv = sum(p.get('total_count',0) for p in active.values())
+        total_inv = sum(p.get('total_count', 0) for p in active.values())
         meds = [p['median'] for p in active.values()]
         spread = round((max(meds)-min(meds))/cross_median*100,1) if len(meds)>=2 and cross_median else 0
 
@@ -409,7 +324,7 @@ def run_scrape():
         }
         save_data(today)
         state['last_success'] = datetime.now(timezone.utc).isoformat()
-        log.info(f"=== Done: {len(active)}/4 platforms | median=${cross_median} | floor=${cross_floor} ===")
+        log.info(f"=== Done: {len(active)}/4 | median=${cross_median} | floor=${cross_floor} ===")
 
     except Exception as e:
         state['last_error'] = str(e)
@@ -424,40 +339,212 @@ def run_scrape():
 def jresp(h, data, status=200):
     body = json.dumps(data, indent=2).encode()
     h.send_response(status)
-    h.send_header('Content-Type','application/json')
-    h.send_header('Content-Length',str(len(body)))
-    h.send_header('Access-Control-Allow-Origin','*')
+    h.send_header('Content-Type', 'application/json')
+    h.send_header('Content-Length', str(len(body)))
+    h.send_header('Access-Control-Allow-Origin', '*')
+    h.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+    h.send_header('Access-Control-Allow-Headers', 'Content-Type')
     h.end_headers()
     h.wfile.write(body)
 
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
+
+    def do_OPTIONS(self):
+        # CORS preflight for browser POSTs
+        self.send_response(204)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.end_headers()
+
+    def do_POST(self):
+        p = urlparse(self.path)
+        path = p.path.rstrip('/')
+        qs = parse_qs(p.query)
+
+        # ── /relay — receive browser-extracted prices for blocked platforms ──
+        # POST JSON: {"token":"bruce11may2026","platform":"seatgeek","floor":1700,"median":1850,"count":22}
+        if path == '/relay':
+            if qs.get('token', [''])[0] != SCRAPE_TOKEN:
+                # Also accept token in body
+                pass
+            try:
+                length = int(self.headers.get('Content-Length', 0))
+                body = json.loads(self.rfile.read(length).decode())
+            except Exception:
+                jresp(self, {'error': 'invalid JSON body'}, 400)
+                return
+
+            # Token check (body or querystring)
+            token = body.get('token', qs.get('token', [''])[0])
+            if token != SCRAPE_TOKEN:
+                jresp(self, {'error': 'unauthorized'}, 401)
+                return
+
+            platform = body.get('platform', '').lower().strip()
+            floor    = body.get('floor')
+            median   = body.get('median')
+            count    = body.get('count', 10)
+
+            if not platform or not floor or not median:
+                jresp(self, {'error': 'required: platform, floor, median'}, 400)
+                return
+
+            # Validate price range
+            if not (PRICE_MIN <= float(floor) <= PRICE_MAX and PRICE_MIN <= float(median) <= PRICE_MAX):
+                jresp(self, {'error': f'prices must be between ${PRICE_MIN} and ${PRICE_MAX}'}, 400)
+                return
+
+            # Load existing relay data and upsert
+            try:
+                with open(RELAY_FILE) as f:
+                    relay = json.load(f)
+            except:
+                relay = {}
+
+            relay[platform] = {
+                'floor': int(floor),
+                'median': int(median),
+                'count': int(count),
+                'date': datetime.now(timezone.utc).strftime('%Y-%m-%d'),
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+            }
+
+            with open(RELAY_FILE, 'w') as f:
+                json.dump(relay, f, indent=2)
+
+            log.info(f"Relay received: {platform} | floor=${floor} | median=${median}")
+            jresp(self, {'status': 'saved', 'platform': platform, 'floor': floor, 'median': median})
+
+        else:
+            jresp(self, {'error': 'not found'}, 404)
+
     def do_GET(self):
         p = urlparse(self.path)
         path = p.path.rstrip('/')
         qs = parse_qs(p.query)
 
-        if path in ('','/'): jresp(self,{'service':'Ticket Desk v3.0','event':'Bruce Springsteen · MSG · May 11 2026','status':'ok'})
-        elif path=='/status': jresp(self,{'service':'Ticket Desk v3.0','running':state['running'],'last_success':state['last_success'],'last_error':state['last_error'],'started_at':state['started_at']})
-        elif path=='/scrape':
-            if qs.get('token',[''])[0] != SCRAPE_TOKEN:
-                jresp(self,{'error':'unauthorized'},401); return
-            if state['running']:
-                jresp(self,{'status':'already_running','started_at':state['started_at']}); return
-            threading.Thread(target=run_scrape,daemon=True).start()
-            jresp(self,{'status':'started'})
-        elif path=='/data':
-            try:
-                body = open(DATA_FILE,'rb').read()
-                self.send_response(200)
-                self.send_header('Content-Type','application/json')
-                self.send_header('Content-Length',str(len(body)))
-                self.send_header('Access-Control-Allow-Origin','*')
-                self.end_headers(); self.wfile.write(body)
-            except FileNotFoundError:
-                jresp(self,{'error':'no data yet'},404)
-        else: jresp(self,{'error':'not found'},404)
+        if path in ('', '/'):
+            jresp(self, {
+                'service': 'Ticket Desk v4.0',
+                'event': 'Bruce Springsteen · MSG · May 11 2026',
+                'status': 'ok',
+                'endpoints': {
+                    'GET /status': 'scraper health',
+                    'GET /scrape?token=X': 'trigger scrape',
+                    'GET /data': 'latest JSON data',
+                    'POST /relay?token=X': 'push browser-extracted prices (for blocked platforms)',
+                }
+            })
 
-if __name__=='__main__':
-    log.info(f"Ticket Desk v3.0 on port {PORT}")
-    HTTPServer(('0.0.0.0',PORT),Handler).serve_forever()
+        elif path == '/status':
+            relay_status = {}
+            try:
+                with open(RELAY_FILE) as f:
+                    relay = json.load(f)
+                for plat, d in relay.items():
+                    relay_status[plat] = {'date': d.get('date'), 'median': d.get('median')}
+            except:
+                pass
+            jresp(self, {
+                'service': 'Ticket Desk v4.0',
+                'running': state['running'],
+                'last_success': state['last_success'],
+                'last_error': state['last_error'],
+                'started_at': state['started_at'],
+                'relay_cache': relay_status,
+            })
+
+        elif path == '/scrape':
+            if qs.get('token', [''])[0] != SCRAPE_TOKEN:
+                jresp(self, {'error': 'unauthorized'}, 401); return
+            if state['running']:
+                jresp(self, {'status': 'already_running', 'started_at': state['started_at']}); return
+            threading.Thread(target=run_scrape, daemon=True).start()
+            jresp(self, {'status': 'started'})
+
+        elif path == '/data':
+            try:
+                body = open(DATA_FILE, 'rb').read()
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self.wfile.write(body)
+            except FileNotFoundError:
+                jresp(self, {'error': 'no data yet — trigger /scrape first'}, 404)
+
+        # ── /relay-form — a simple browser UI for entering relay prices manually ──
+        elif path == '/relay-form':
+            token = qs.get('token', [''])[0]
+            if token != SCRAPE_TOKEN:
+                jresp(self, {'error': 'unauthorized'}, 401); return
+            html = f"""<!DOCTYPE html>
+<html><head><meta charset=UTF-8><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ticket Desk — Relay Prices</title>
+<style>
+  body{{font-family:monospace;background:#0a0c0f;color:#c8d4e0;padding:20px;max-width:500px;margin:0 auto}}
+  h2{{color:#ffd700;letter-spacing:.1em}}
+  label{{font-size:11px;color:#5a6a7a;letter-spacing:.15em;text-transform:uppercase;display:block;margin-top:14px;margin-bottom:4px}}
+  input,select{{width:100%;background:#0f1217;border:1px solid #2a3444;color:#e8f0f8;font-family:monospace;font-size:14px;padding:8px;border-radius:3px;box-sizing:border-box}}
+  button{{width:100%;margin-top:20px;padding:12px;background:#ffd700;color:#000;border:none;border-radius:3px;font-family:monospace;font-size:13px;font-weight:700;letter-spacing:.15em;cursor:pointer}}
+  button:hover{{filter:brightness(1.1)}}
+  #msg{{margin-top:14px;padding:10px;border-radius:3px;display:none;font-size:12px}}
+  .ok{{background:rgba(0,230,118,.1);color:#00e676;border:1px solid rgba(0,230,118,.3)}}
+  .err{{background:rgba(255,68,68,.1);color:#ff4444;border:1px solid rgba(255,68,68,.3)}}
+  p{{font-size:12px;color:#5a6a7a;line-height:1.6}}
+</style></head>
+<body>
+<h2>▸ RELAY PRICES</h2>
+<p>Open the platform in this browser tab, find Section 224 listings, note the floor and median, then enter them here. This bypasses the server IP block.</p>
+<label>Platform</label>
+<select id=plat>
+  <option value="seatgeek">SeatGeek</option>
+  <option value="tickpick">TickPick</option>
+  <option value="stubhub">StubHub (override)</option>
+  <option value="vividseats">VividSeats (override)</option>
+</select>
+<label>Section 224 Floor Price ($)</label>
+<input type=number id=floor placeholder="e.g. 1700" min=800 max=12000>
+<label>Section 224 Median Price ($)</label>
+<input type=number id=median placeholder="e.g. 1850" min=800 max=12000>
+<label>Approx # of Listings Visible</label>
+<input type=number id=count placeholder="e.g. 18" min=1 max=500>
+<button onclick=submit()>▶ SAVE RELAY DATA</button>
+<div id=msg></div>
+<script>
+async function submit(){{
+  const body = {{
+    token: '{SCRAPE_TOKEN}',
+    platform: document.getElementById('plat').value,
+    floor: parseInt(document.getElementById('floor').value),
+    median: parseInt(document.getElementById('median').value),
+    count: parseInt(document.getElementById('count').value)||10,
+  }};
+  if(!body.floor||!body.median){{show('Enter both floor and median prices.','err');return;}}
+  try{{
+    const r = await fetch('/relay',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(body)}});
+    const d = await r.json();
+    if(d.status==='saved') show(`✓ Saved: ${{body.platform}} | floor=${{body.floor}} | median=${{body.median}}. Trigger a scrape to incorporate.`,'ok');
+    else show(JSON.stringify(d),'err');
+  }}catch(e){{show('Error: '+e,'err');}}
+}}
+function show(msg,cls){{const el=document.getElementById('msg');el.textContent=msg;el.className=cls;el.style.display='block';}}
+</script></body></html>"""
+            body = html.encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        else:
+            jresp(self, {'error': 'not found'}, 404)
+
+
+if __name__ == '__main__':
+    log.info(f"Ticket Desk v4.0 on port {PORT}")
+    HTTPServer(('0.0.0.0', PORT), Handler).serve_forever()
